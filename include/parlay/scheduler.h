@@ -30,7 +30,7 @@
 //
 // Default: true
 #ifndef PARLAY_ELASTIC_PARALLELISM
-#define PARLAY_ELASTIC_PARALLELISM true
+#define PARLAY_ELASTIC_PARALLELISM false
 #endif
 
 
@@ -97,6 +97,7 @@ struct scheduler {
  public:
 
   const worker_id_type num_threads;
+  int num_groups;
 
   // If the current thread is a worker of an existing scheduler, or the thread that spawned
   // a scheduler, return the most recent such scheduler.  Otherwise, returns null.
@@ -104,13 +105,14 @@ struct scheduler {
     return worker_info.my_scheduler;
   }
 
-  explicit scheduler(size_t num_workers)
-      : num_threads(num_workers),
-        num_deques(num_threads),
+  explicit scheduler(size_t num_workers_per_group, size_t num_worker_groups = 1)
+      : num_threads(num_worker_groups * num_workers_per_group),
+        num_groups(num_worker_groups),
+        num_deques_per_group(num_workers_per_group),
         num_awake_workers(num_threads),
         parent_worker_info(std::exchange(worker_info, workerInfo{0, this})),
-        deques(num_deques),
-        attempts(num_deques),
+        deques(num_threads),
+        attempts(num_threads),
         spawned_threads(),
         finished_flag(false) {
 
@@ -129,8 +131,8 @@ struct scheduler {
   }
 
   // Push onto local stack.
-  void spawn(Job* job) {
-    int id = worker_id();
+  void spawn(Job* job, int group_id = -1) {
+    int id = (group_id == -1) ? worker_id() : group_id;
     [[maybe_unused]] bool first = deques[id].push_bottom(job);
 #if PARLAY_ELASTIC_PARALLELISM
     if (first) wake_up_a_worker();
@@ -177,7 +179,7 @@ struct scheduler {
     size_t val;
   };
 
-  int num_deques;
+  int num_deques_per_group;
   std::atomic<size_t> num_awake_workers;
   workerInfo parent_worker_info;
   std::vector<internal::Deque<Job>> deques;
@@ -253,19 +255,21 @@ struct scheduler {
     const auto start_time = std::chrono::steady_clock::now();
     do {
       // By coupon collector's problem, this should touch all.
-      for (size_t i = 0; i <= YIELD_FACTOR * num_deques; i++) {
+      for (size_t i = 0; i <= YIELD_FACTOR * num_deques_per_group; i++) {
         if (break_early()) return nullptr;
         Job* job = try_steal(id);
         if (job) return job;
       }
-      std::this_thread::sleep_for(std::chrono::nanoseconds(num_deques * 100));
+      std::this_thread::sleep_for(std::chrono::nanoseconds(num_deques_per_group * 100));
     } while (!timeout || std::chrono::steady_clock::now() - start_time < STEAL_TIMEOUT);
     return nullptr;
   }
 
   Job* try_steal(size_t id) {
     // use hashing to get "random" target
-    size_t target = (hash(id) + hash(attempts[id].val)) % num_deques;
+    int group_id = id % num_groups;
+    size_t target = (hash(id) + hash(attempts[id].val)) % num_deques_per_group;
+    target = (target * num_groups) + group_id;
     attempts[id].val++;
     auto [job, empty] = deques[target].pop_top();
 #if PARLAY_ELASTIC_PARALLELISM
@@ -362,6 +366,12 @@ class fork_join_scheduler {
     parfor_(scheduler, start, end, f, granularity, conservative);
   }
 
+  template <typename F>
+  static void parforgroup(scheduler_t &scheduler, size_t *starts, size_t *ends, F&& f, size_t granularity = 1, bool conservative = false) {
+    assert(granularity >= 1);
+    parforgroup_(scheduler, 0, starts, ends, f, granularity, conservative);
+  }
+
  private:
   template <typename F>
   static size_t get_granularity(size_t start, size_t end, F& f) {
@@ -396,6 +406,35 @@ class fork_join_scheduler {
     }
   }
 
+  template <typename L, typename R>
+  static void pardogroup(scheduler_t &scheduler, int group_id, L &&left, R &&right, bool conservative) {
+    auto execute_right = [&]() { std::forward<R>(right)(); };
+    auto right_job = make_job(right);
+    scheduler.spawn(&right_job, group_id + 1);
+    std::forward<L>(left)();
+    if (const Job* job = scheduler.get_own_job(); job != nullptr) {
+      assert(job == &right_job);
+      execute_right();
+    }
+    else {
+      auto done = [&]() { return right_job.finished(); };
+      scheduler.wait_until(done, conservative);
+      assert(right_job.finished());
+    }
+  }
+
+  template <typename F>
+  static void parforgroup_(scheduler_t &scheduler, int group_id, size_t *starts, size_t *ends, F& f, size_t granularity, bool conservative) {
+    if (group_id == scheduler.num_groups - 1) {
+      parfor_(scheduler, starts[group_id], ends[group_id], f, granularity, conservative);
+    }
+    else {
+      pardogroup(scheduler, group_id,
+                 [&]() { parfor_(scheduler, starts[group_id], ends[group_id], f, granularity, conservative); },
+                 [&]() { parforgroup_(scheduler, group_id + 1, starts, ends, f, granularity, conservative); },
+                 conservative);
+    }
+  }
 };
 
 }  // namespace parlay
