@@ -40,8 +40,7 @@ inline void parallel_for(size_t start, size_t end, F&& f, long granularity = 0,
                          bool conservative = false);
 
 template <typename F>
-inline void parallel_for_group(size_t *starts, size_t *ends, F&& f, long granularity = 1,
-                               bool conservative = false);
+inline void parallel_group(F&& f, long granularity = 1, bool conservative = false);
 
 // runs the thunks left and right in parallel.
 //    both left and write should map void to void
@@ -192,6 +191,10 @@ inline void set_num_groups(int num_groups) {
   (void)internal::get_current_scheduler(num_groups);
 }
 
+inline int num_groups() {
+  return internal::get_current_scheduler().num_groups;
+}
+
 inline size_t num_workers() {
   return internal::get_current_scheduler().num_workers();
 }
@@ -217,8 +220,8 @@ inline void parallel_for(size_t start, size_t end, F&& f, long granularity, bool
 }
 
 template <typename F>
-inline void parallel_for_group(size_t *starts, size_t *ends, F&& f, long granularity, bool conservative) {
-  fork_join_scheduler::parforgroup(internal::get_current_scheduler(), starts, ends,
+inline void parallel_group(F&& f, long granularity, bool conservative) {
+  fork_join_scheduler::parforgroup(internal::get_current_scheduler(),
     std::forward<F>(f), static_cast<size_t>(granularity), conservative);
 }
 

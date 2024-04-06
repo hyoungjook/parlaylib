@@ -94,6 +94,11 @@ struct scheduler {
 
   static inline thread_local workerInfo worker_info{};
 
+  constexpr static size_t MAX_NUM_GROUPS = 2;
+  struct alignas(64) padded_job {
+    std::atomic<Job*> job;
+  } per_group_initial_jobs[MAX_NUM_GROUPS];
+
  public:
 
   const worker_id_type num_threads;
@@ -116,6 +121,10 @@ struct scheduler {
         spawned_threads(),
         finished_flag(false) {
 
+    for (int group_id = 0; group_id < num_groups; group_id++) {
+      per_group_initial_jobs[group_id].job.store(nullptr, std::memory_order_seq_cst);
+    }
+
     // Spawn num_threads many threads on startup
     for (worker_id_type i = 1; i < num_threads; ++i) {
       spawned_threads.emplace_back([&, i]() {
@@ -131,12 +140,17 @@ struct scheduler {
   }
 
   // Push onto local stack.
-  void spawn(Job* job, int group_id = -1) {
-    int id = (group_id == -1) ? worker_id() : group_id;
+  void spawn(Job* job) {
+    int id = worker_id();
     [[maybe_unused]] bool first = deques[id].push_bottom(job);
 #if PARLAY_ELASTIC_PARALLELISM
     if (first) wake_up_a_worker();
 #endif
+  }
+
+  // Push onto group leader's initial job board
+  void spawn_to_other_group(Job *job, int group_id) {
+    per_group_initial_jobs[group_id].job.store(job, std::memory_order_relaxed);
   }
 
   // Wait until the given condition is true.
@@ -162,7 +176,7 @@ struct scheduler {
 
   // Pop from local stack.
   Job* get_own_job() {
-    auto id = worker_id();
+    int id = worker_id();
     return deques[id].pop_bottom();
   }
 
@@ -266,6 +280,14 @@ struct scheduler {
   }
 
   Job* try_steal(size_t id) {
+    // if group leader, first check initial_jobs
+    if (id < (size_t)num_groups) {
+      Job *job = per_group_initial_jobs[id].job.load(std::memory_order_acquire);
+      if (job != nullptr) {
+        per_group_initial_jobs[id].job.store(nullptr, std::memory_order_release);
+        return job;
+      }
+    }
     // use hashing to get "random" target
     int group_id = id % num_groups;
     size_t target = (hash(id) + hash(attempts[id].val)) % num_deques_per_group;
@@ -367,9 +389,9 @@ class fork_join_scheduler {
   }
 
   template <typename F>
-  static void parforgroup(scheduler_t &scheduler, size_t *starts, size_t *ends, F&& f, size_t granularity = 1, bool conservative = false) {
+  static void parforgroup(scheduler_t &scheduler, F&& f, size_t granularity = 1, bool conservative = false) {
     assert(granularity >= 1);
-    parforgroup_(scheduler, 0, starts, ends, f, granularity, conservative);
+    parforgroup_(scheduler, 0, f, granularity, conservative);
   }
 
  private:
@@ -408,30 +430,23 @@ class fork_join_scheduler {
 
   template <typename L, typename R>
   static void pardogroup(scheduler_t &scheduler, int group_id, L &&left, R &&right, bool conservative) {
-    auto execute_right = [&]() { std::forward<R>(right)(); };
     auto right_job = make_job(right);
-    scheduler.spawn(&right_job, group_id + 1);
+    scheduler.spawn_to_other_group(&right_job, group_id + 1);
     std::forward<L>(left)();
-    if (const Job* job = scheduler.get_own_job(); job != nullptr) {
-      assert(job == &right_job);
-      execute_right();
-    }
-    else {
-      auto done = [&]() { return right_job.finished(); };
-      scheduler.wait_until(done, conservative);
-      assert(right_job.finished());
-    }
+    auto done = [&]() { return right_job.finished(); };
+    scheduler.wait_until(done, conservative);
+    assert(right_job.finished());
   }
 
   template <typename F>
-  static void parforgroup_(scheduler_t &scheduler, int group_id, size_t *starts, size_t *ends, F& f, size_t granularity, bool conservative) {
+  static void parforgroup_(scheduler_t &scheduler, int group_id, F& f, size_t granularity, bool conservative) {
     if (group_id == scheduler.num_groups - 1) {
-      parfor_(scheduler, starts[group_id], ends[group_id], f, granularity, conservative);
+      f(group_id);
     }
     else {
       pardogroup(scheduler, group_id,
-                 [&]() { parfor_(scheduler, starts[group_id], ends[group_id], f, granularity, conservative); },
-                 [&]() { parforgroup_(scheduler, group_id + 1, starts, ends, f, granularity, conservative); },
+                 [&]() { f(group_id); },
+                 [&]() { parforgroup_(scheduler, group_id + 1, f, granularity, conservative); },
                  conservative);
     }
   }
